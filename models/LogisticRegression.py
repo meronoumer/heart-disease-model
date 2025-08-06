@@ -1,6 +1,6 @@
-# #Heart Disease Project AI4ALL, August 2025
-# # Author: Natalie Hicks
-# #Logistic Regression using sklearn
+#Heart Disease Project AI4ALL, August 2025
+# Author: Natalie Hicks
+#Logistic Regression using sklearn
 
 import pandas as pd
 from pathlib import Path
@@ -25,10 +25,18 @@ X_test = scaler.transform(X_test)
 y_train = y_train.drop(columns=y_train.columns[0])
 y_test = y_test.drop(columns=y_test.columns[0])
 
-# Train multinomial logistic regression model
-model = MultiOutputClassifier(
-    LogisticRegression(solver='saga', max_iter=10000, random_state=42, class_weight='balanced')
+# logistic regression model
+tuned_logreg = LogisticRegression(
+    solver='saga',
+    penalty='elasticnet',
+    l1_ratio=0.5,
+    C=0.5,
+    class_weight='balanced',
+    max_iter=10000,
+    random_state=42
 )
+
+model = MultiOutputClassifier(tuned_logreg)
 model.fit(X_train, y_train)
 
 # Evaluation of accuracy. Where results mean:
@@ -42,4 +50,5 @@ print("Model Evaluation:")
 print(classification_report(y_test, y_pred, target_names=['AS', 'AR', 'MR', 'MS', 'N'], zero_division=0))
 print(f"\nHamming Loss: {hamming_loss(y_test, y_pred):.4f}")
 print(f"Exact Match Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+
 
