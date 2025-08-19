@@ -1,314 +1,561 @@
-import streamlit as st
-import pandas as pd
+# streamlit_app.py
+# ------------------------------------------------------------
+# Heart Disease Model Demo App
+#
+# Features:
+# - Configurable model loader (no hard-coded paths)
+# - Use data from repo CSV, user-uploaded CSV (single/batch), or uploaded audio
+# - Parses "mfcc devation" -> mfcc_dev_* columns to match training schema
+# - Aligns features to model's expected columns
+# - Displays per-label probabilities and decisions (thresholded)
+# - Batch scoring with downloadable results
+# - Caching + robust error handling
+#
+# Suggested requirements.txt (example):
+# streamlit
+# pandas
+# numpy
+# scikit-learn
+# joblib
+# librosa
+# soundfile
+# hmmlearn   # if your artifact uses HMMs internally
+#
+# ------------------------------------------------------------
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+import json
+import time
+import warnings
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
-from joblib import load
-from typing import Any, Dict, Optional, Tuple, List
+import pandas as pd
+import joblib
+import streamlit as st
 
-st.set_page_config(page_title="Heart Disease Ensemble (Stacked) Demo", page_icon="🫀", layout="centered")
+# Optional audio dependencies
+try:
+    import librosa
+except Exception:
+    librosa = None
 
-# --------------------------------------------------------------------
-# Settings / defaults
-# --------------------------------------------------------------------
-# Your merged model filename comes first:
-CANDIDATE_MODEL_FILES = [
-    "final_stacked_classifier_model.pkl",
-    "hmm_multilabel_pipeline.joblib",  # fallback to older artifact
-]
+# Quiet known noisy warnings from hmmlearn if your model bundles HMMs
+warnings.filterwarnings("ignore", message="Some rows of transmat_", module="hmmlearn")
+warnings.filterwarnings("ignore", message="invalid value encountered", module="hmmlearn")
 
+# -------------------------- App Config --------------------------
+st.set_page_config(
+    page_title="Heart Disease Model — Demo",
+    page_icon="🫀",
+    layout="wide",
+)
+
+# Constants used in your training pipeline
 DEFAULT_LABELS = ["AS", "AR", "MR", "MS", "N"]
-META_COLS = [
+DEFAULT_SEQ_KEY = "file_key"
+DEFAULT_PATIENT_KEY = "patient_id_x"
+DEFAULT_META_COLS = [
     "Unnamed: 0", "patient_id_x", "file_key", "audio_filename_base",
     "Age", "Gender", "Smoker", "Lives"
 ]
-LABEL_COLS = DEFAULT_LABELS  # if labels exist in CSV; they won't be used at inference
+DEFAULT_LABEL_COLS = ["AS", "AR", "MR", "MS", "N"]
 
-# --------------------------------------------------------------------
-# Loaders & helpers
-# --------------------------------------------------------------------
-def try_load_any(paths: List[str]) -> Tuple[Any, str]:
-    last_err = None
-    for p in paths:
-        try:
-            obj = load(p)
-            return obj, p
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Could not load any model file from {paths}. Last error: {last_err}")
-
-@st.cache_resource
-def load_artifact() -> Tuple[Any, str]:
-    return try_load_any(CANDIDATE_MODEL_FILES)
-
-@st.cache_data
-def load_data(csv_path: str = "extracted_features_df.csv") -> pd.DataFrame:
-    return pd.read_csv(csv_path)
-
-def parse_mfcc_dev(s: str) -> list[float]:
+# -------------------------- Utility Functions --------------------------
+def parse_mfcc_dev_str(s: str) -> List[float]:
+    """Parse a string like '[0.1 0.2 0.3 ...]' into a list of floats."""
+    if pd.isna(s):
+        return []
     content = str(s).strip().lstrip("[").rstrip("]")
-    if not content:
-        return []
-    try:
-        return [float(x) for x in content.split()]
-    except Exception:
-        return []
+    return [float(x) for x in content.split()] if content else []
 
-def expand_mfcc_dev(df: pd.DataFrame) -> pd.DataFrame:
-    if "mfcc devation" in df.columns:
-        parsed = df["mfcc devation"].apply(parse_mfcc_dev)
-        if len(parsed) and len(parsed.iloc[0]) > 0:
-            n_feats = len(parsed.iloc[0])
-            mfcc_cols = [f"mfcc_dev_{i}" for i in range(n_feats)]
-            df_mfcc = pd.DataFrame(parsed.tolist(), columns=mfcc_cols, index=df.index)
-            df = pd.concat([df.drop(columns=["mfcc devation"]), df_mfcc], axis=1)
-    return df
+def expand_mfcc_dev_column(df: pd.DataFrame, col: str = "mfcc devation") -> pd.DataFrame:
+    """If 'mfcc devation' exists, expand it into mfcc_dev_* columns."""
+    if col not in df.columns:
+        return df
 
-def pick_feature_cols(df: pd.DataFrame, feature_cols_from_artifact: Optional[List[str]]) -> List[str]:
-    if feature_cols_from_artifact:
-        return feature_cols_from_artifact
-    # Fallback: use all numeric columns except obvious meta/label columns
-    exclude = set(META_COLS + LABEL_COLS)
-    num_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
-    if not num_cols:
-        raise RuntimeError("No numeric feature columns found to feed the model.")
-    return num_cols
+    parsed = df[col].apply(parse_mfcc_dev_str)
+    if len(parsed) == 0 or len(parsed.iloc[0]) == 0:
+        # Nothing to expand; drop the text column to avoid confusion
+        return df.drop(columns=[col])
 
-def sequence_indices(df: pd.DataFrame, file_key: Any) -> np.ndarray:
-    return df.index[df["file_key"] == file_key].to_numpy()
+    n_feats = len(parsed.iloc[0])
+    mfcc_cols = [f"mfcc_dev_{i}" for i in range(n_feats)]
+    df_mfcc = pd.DataFrame(parsed.tolist(), columns=mfcc_cols, index=df.index)
+    out = pd.concat([df.drop(columns=[col]), df_mfcc], axis=1)
+    return out
 
-def aggregate_probs(probs_2d: np.ndarray, how: str = "mean") -> np.ndarray:
+def align_features(
+    X: pd.DataFrame,
+    feature_cols: List[str]
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """Align X's columns to the required feature_cols."""
+    missing = [c for c in feature_cols if c not in X.columns]
+    extra = [c for c in X.columns if c not in feature_cols]
+
+    # Create missing columns with NaN; downstream pipelines should handle imputation
+    for c in missing:
+        X[c] = np.nan
+
+    X = X[feature_cols]
+    return X, missing, extra
+
+def guess_feature_cols_from_artifact(model_art):
+    """Try to read feature columns from the artifact in a robust way."""
+    # If artifact is a dict-like bundle (your earlier pattern)
+    if isinstance(model_art, dict):
+        if "feature_cols" in model_art:
+            return list(model_art["feature_cols"])
+        # Sometimes a nested pipeline might exist:
+        inner = model_art.get("pipeline") or model_art.get("model") or model_art.get("clf")
+        if hasattr(inner, "feature_names_in_"):
+            return list(inner.feature_names_in_)
+
+    # If it's a scikit estimator/pipeline
+    if hasattr(model_art, "feature_names_in_"):
+        return list(model_art.feature_names_in_)
+
+    # Unknown; fallback to None (we'll try to infer from dataset)
+    return None
+
+def guess_labels_from_artifact(model_art) -> List[str]:
+    """Try to read labels from the artifact; fallback to DEFAULT_LABELS."""
+    if isinstance(model_art, dict):
+        if "labels" in model_art and isinstance(model_art["labels"], (list, tuple)):
+            return list(model_art["labels"])
+
+    # For multi-output classifiers, there may not be a simple .classes_ list
+    # Default to your known labels
+    return DEFAULT_LABELS
+
+def predict_proba_from_artifact(model_art, X: pd.DataFrame) -> np.ndarray:
     """
-    probs_2d: shape (T, C) where T is frames, C is classes/labels.
-    Returns shape (C,)
+    Try to produce (n_samples, n_labels) probabilities.
+    Supports:
+    - scikit estimators with predict_proba (single-label or multi-label/OvR)
+    - custom dict bundles exposing a callable 'predict_proba' or 'pipeline'
     """
-    if probs_2d.ndim != 2:
-        raise ValueError("Expected 2D probs array (frames x classes).")
-    if how == "mean":
-        return np.nanmean(probs_2d, axis=0)
-    if how == "median":
-        return np.nanmedian(probs_2d, axis=0)
-    if how == "max":
-        return np.nanmax(probs_2d, axis=0)
-    return np.nanmean(probs_2d, axis=0)
+    # If dict bundle with callable
+    if isinstance(model_art, dict):
+        # Common storage patterns:
+        if "predict_proba" in model_art and callable(model_art["predict_proba"]):
+            return model_art["predict_proba"](X)
 
-def estimator_predict_proba_any(estimator, X: np.ndarray) -> np.ndarray:
-    """
-    Try to get per-sample probabilities for multi-label/multi-class and return (n_samples, n_labels).
-    Handles common sklearn APIs (Pipeline, OneVsRest, Stacking, etc.).
-    """
-    if hasattr(estimator, "predict_proba"):
-        p = estimator.predict_proba(X)
-        # Many estimators return (n_samples, n_classes).
-        # Some multioutput classifiers return a list of arrays—handle that too.
-        if isinstance(p, list):
-            # List of (n_samples, 2) for each binary label -> stack [:, 1]
+        # Pipeline/estimator inside dict
+        for key in ("pipeline", "model", "clf"):
+            if key in model_art and hasattr(model_art[key], "predict_proba"):
+                est = model_art[key]
+                proba = est.predict_proba(X)
+                # predict_proba can be list of arrays (for multi-output OvR style)
+                if isinstance(proba, list):
+                    # Stack per-output probabilities of positive class
+                    cols = []
+                    for arr in proba:
+                        arr = np.asarray(arr)
+                        if arr.ndim == 2 and arr.shape[1] >= 2:
+                            cols.append(arr[:, 1])
+                        else:
+                            cols.append(arr.ravel())
+                    return np.column_stack(cols)
+                proba = np.asarray(proba)
+                if proba.ndim == 3:
+                    # Some wrappers return (n_outputs, n_samples, n_classes)
+                    # Reduce to positive class per output
+                    return np.transpose(proba[:, :, 1])
+                if proba.ndim == 2 and proba.shape[1] > 1:
+                    # Single multi-class -> return as-is
+                    return proba
+                # Otherwise treat as binary
+                return proba.reshape(-1, 1)
+
+        # If no direct estimator, try simple weighted logic (if saved)
+        if "stacked" in model_art and hasattr(model_art["stacked"], "predict_proba"):
+            proba = model_art["stacked"].predict_proba(X)
+            return np.asarray(proba)
+
+    # If bare estimator/pipeline
+    if hasattr(model_art, "predict_proba"):
+        proba = model_art.predict_proba(X)
+        if isinstance(proba, list):
             cols = []
-            for arr in p:
+            for arr in proba:
                 arr = np.asarray(arr)
                 if arr.ndim == 2 and arr.shape[1] >= 2:
                     cols.append(arr[:, 1])
                 else:
                     cols.append(arr.ravel())
             return np.column_stack(cols)
-        else:
-            p = np.asarray(p)
-            # If binary single-output with shape (n,2), return p[:,1:2]; if multi-label already (n,C), return as-is
-            if p.ndim == 2 and p.shape[1] >= 2:
-                return p if p.shape[1] > 2 else p[:, 1:2]
-            return p.reshape(-1, 1)
-    # Fallbacks
-    if hasattr(estimator, "decision_function"):
-        z = estimator.decision_function(X)
-        z = np.asarray(z)
-        # Sigmoid to map to (0,1)
-        return 1.0 / (1.0 + np.exp(-z))
-    if hasattr(estimator, "predict"):
-        y = estimator.predict(X)
-        return np.asarray(y).reshape(-1, 1).astype(float)
-    # Last resort: 0.5
-    return np.full((X.shape[0], 1), 0.5, dtype=float)
+        proba = np.asarray(proba)
+        if proba.ndim == 3:
+            return np.transpose(proba[:, :, 1])
+        if proba.ndim == 2 and proba.shape[1] > 1:
+            return proba
+        return proba.reshape(-1, 1)
 
-def hmm_delta(pos_hmm, neg_hmm, seq: np.ndarray) -> float:
-    T = max(1, len(seq))
-    return float((pos_hmm.score(seq) - neg_hmm.score(seq)) / T)
+    raise RuntimeError("Loaded artifact does not expose a usable predict_proba interface.")
 
-def hmm_to_prob(delta: float, center: float = 0.0, temp: float = 1.0) -> float:
-    return float(1.0 / (1.0 + np.exp(-(delta - center) / max(1e-6, temp))))
-
-# --------------------------------------------------------------------
-# App
-# --------------------------------------------------------------------
-def main():
-    st.title("🫀 Heart Disease Ensemble (Stacked) – Inference")
-    st.write(
-        "This app loads your **merged/stacked model** (`final_stacked_classifier_model.pkl`) "
-        "and predicts per-label probabilities for a selected `file_key`."
-    )
-
-    # Load artifact
-    try:
-        artifact, fname = load_artifact()
-    except Exception as e:
-        st.error(f"Failed to load model artifact: {e}")
-        st.stop()
-
-    st.caption(f"Loaded: `{fname}`")
-
-    # Load data
-    try:
-        df_raw = load_data()
-    except Exception as e:
-        st.error(f"Failed to read `extracted_features_df.csv`: {e}")
-        st.stop()
-
-    if "file_key" not in df_raw.columns:
-        st.error("`file_key` column not found in CSV.")
-        st.stop()
+def aggregate_group_rows_to_single_vector(grp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert possibly many rows per file_key into a single feature row.
+    - Parses 'mfcc devation' (if present) from the FIRST non-null and expands to mfcc_dev_*
+    - Averages other numeric columns
+    """
+    # Work on a copy
+    g = grp.copy()
 
     # Expand MFCC deviation if present
-    df = expand_mfcc_dev(df_raw.copy())
+    g = expand_mfcc_dev_column(g, col="mfcc devation")
 
-    # Branch 1: artifact is a dict (HMM + optional LR/RF path from earlier)
-    if isinstance(artifact, dict):
-        labels = artifact.get("labels", DEFAULT_LABELS)
-        feature_cols = artifact.get("feature_cols", None)
-        imputer = artifact.get("imputer", None)
-        scaler = artifact.get("scaler", None)
-        thresholds = artifact.get("thresholds", None)
-        ensemble_thresholds = artifact.get("ensemble_thresholds", None)
-        weights = artifact.get("ensemble_weights", None)
+    # Pick numeric columns (skip obvious meta/labels)
+    cols_to_skip = set(DEFAULT_META_COLS + DEFAULT_LABEL_COLS)
+    num_cols = [c for c in g.columns if c not in cols_to_skip and pd.api.types.is_numeric_dtype(g[c])]
 
-        # HMM path
-        hmm_models = artifact.get("models") or artifact.get("hmm_models")
-        lr_models = artifact.get("logreg_models")
-        rf_models = artifact.get("rf_models")
+    if not num_cols:
+        # Fallback: just take first row (after expansion)
+        return g.iloc[[0]].drop(columns=[c for c in g.columns if c in DEFAULT_LABEL_COLS], errors="ignore")
 
-        if any(v is None for v in [labels, imputer, scaler]):
-            st.error("Artifact dict is missing one of: labels, imputer, scaler.")
-            st.stop()
+    # Aggregate by mean for numeric features
+    agg = g[num_cols].mean(axis=0, skipna=True).to_frame().T
+    return agg
 
-        # Prepare features
-        if feature_cols is None:
-            feature_cols = pick_feature_cols(df, None)
-        X_raw = df[feature_cols].astype(float).values
-        X_imp = imputer.transform(X_raw)
-        X_scaled = scaler.transform(X_imp)
+def human_prob(p: float) -> str:
+    return f"{100.0 * float(p):.1f}%"
 
-        st.write("**Detected components**:",
-                 ", ".join([name for name, present in {
-                     "HMM": hmm_models is not None,
-                     "LogReg": lr_models is not None,
-                     "RandomForest": rf_models is not None
-                 }.items() if present]) or "none")
+def df_download_button(df: pd.DataFrame, label: str, filename: str):
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
-        # Pick file_key
-        keys = sorted(df["file_key"].unique())
-        fk = st.selectbox("Choose a file_key:", keys)
-        idxs = sequence_indices(df, fk)
-        if idxs.size == 0:
-            st.warning("No rows found for that file_key.")
-            st.stop()
-        X_seq = X_scaled[idxs, :]
 
-        # Score per label
-        rows = []
-        for lab in labels:
-            out = {"label": lab, "prob_combined": None, "decision": None}
-            parts: Dict[str, float] = {}
+# -------------------------- Caching --------------------------
+@st.cache_resource(show_spinner=False)
+def load_model_resource(path: str):
+    return joblib.load(path)
 
-            # HMM
-            if hmm_models and lab in hmm_models:
-                pos_hmm, neg_hmm = hmm_models[lab]
-                d = hmm_delta(pos_hmm, neg_hmm, X_seq)
-                thr = thresholds.get(lab) if isinstance(thresholds, dict) else 0.0
-                parts["hmm"] = hmm_to_prob(d, center=float(thr))
+@st.cache_data(show_spinner=False)
+def load_csv_cached(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
 
-            # LR
-            if lr_models and lab in lr_models:
-                p = estimator_predict_proba_any(lr_models[lab], X_seq)
-                parts["logreg"] = float(np.nanmean(p[:, -1]))  # positive class
+# -------------------------- Sidebar: Configuration --------------------------
+st.title("🫀 Heart Disease Model — Interactive Demo")
+st.markdown(
+    "This app lets you run predictions with your **merged ensemble model**. "
+    "You can pick a case from your dataset, upload your own CSV, or even upload an audio file "
+    "to extract MFCC-based features on the fly.\n\n"
+    "**Note:** This tool is for **educational/research** use only and **not** a medical device."
+)
 
-            # RF
-            if rf_models and lab in rf_models:
-                p = estimator_predict_proba_any(rf_models[lab], X_seq)
-                parts["rf"] = float(np.nanmean(p[:, -1]))
+with st.sidebar:
+    st.header("⚙️ Settings")
+    model_path = st.text_input(
+        "Model file path",
+        value="final_stacked_classifier_model.pkl",
+        help="Path to your model artifact. You can replace this with any accessible path.",
+    )
+    dataset_path = st.text_input(
+        "Dataset CSV (optional)",
+        value="extracted_features_df.csv",
+        help="Used for 'Pick from dataset' mode. Leave blank if you won't use it.",
+    )
+    labels_input = st.text_input(
+        "Label names (comma-separated)",
+        value="AS,AR,MR,MS,N",
+        help="Used for display and decisions if the artifact doesn't provide labels.",
+    )
+    user_labels = [x.strip() for x in labels_input.split(",") if x.strip()] or DEFAULT_LABELS
 
-            if parts:
-                # Weighted combine if weights provided (normalize), else equal
-                keys_present = list(parts.keys())
-                if weights:
-                    w = np.array([max(0.0, float(weights.get(k, 0.0))) for k in keys_present], dtype=float)
-                    if w.sum() == 0:
-                        w = np.ones(len(keys_present))
-                else:
-                    w = np.ones(len(keys_present))
-                w = w / w.sum()
-                probs = np.array([parts[k] for k in keys_present], dtype=float)
-                combined = float(np.dot(w, probs))
-                out["prob_combined"] = combined
+    st.caption("Tip: Update paths and labels here. The app reloads resources automatically when changed.")
 
-                # decide
-                thr_final = None
-                if isinstance(ensemble_thresholds, dict):
-                    thr_final = ensemble_thresholds.get(lab, None)
-                if thr_final is None:
-                    thr_final = 0.5
-                out["decision"] = int(combined >= thr_final)
-            rows.append(out)
+# Load model (with error handling)
+model_artifact = None
+feature_cols_from_artifact = None
+labels_from_artifact = None
+thresholds_from_artifact: Optional[Dict[str, float]] = None
 
-        st.subheader("Predictions (ensemble)")
-        st.dataframe(pd.DataFrame(rows).set_index("label"))
-        st.caption("Thresholds: ensemble_thresholds if provided; otherwise 0.5 on combined probability.")
-
-        return  # end dict path
-
-    # Branch 2: artifact is a fitted sklearn estimator (e.g., StackingClassifier or Pipeline)
-    model = artifact
-    st.write("**Detected artifact type:** sklearn estimator / pipeline")
-
-    # If the model is a Pipeline that already includes preprocessing, you can feed raw features.
-    # Otherwise we’ll pick numeric features (excluding meta/label columns).
+with st.spinner("Loading model..."):
     try:
-        feature_cols = pick_feature_cols(df, None)
+        if model_path.strip():
+            model_artifact = load_model_resource(model_path.strip())
+            feature_cols_from_artifact = guess_feature_cols_from_artifact(model_artifact)
+            labels_from_artifact = guess_labels_from_artifact(model_artifact)
+            if isinstance(model_artifact, dict) and "thresholds" in model_artifact:
+                # Expect thresholds as dict {label: float}
+                thresholds_from_artifact = dict(model_artifact["thresholds"])
+        else:
+            st.warning("Please provide a valid model file path in the sidebar.")
     except Exception as e:
-        st.error(f"Could not determine feature columns: {e}")
-        st.stop()
+        st.error(f"Failed to load model: {e}")
 
-    # Choose a file_key
-    keys = sorted(df["file_key"].unique())
-    fk = st.selectbox("Choose a file_key:", keys)
-    idxs = sequence_indices(df, fk)
-    if idxs.size == 0:
-        st.warning("No rows found for that file_key.")
-        st.stop()
+# Load dataset (optional)
+dataset_df = None
+if dataset_path.strip():
+    try:
+        dataset_df = load_csv_cached(dataset_path.strip())
+    except Exception as e:
+        st.warning(f"Could not load dataset CSV: {e}")
 
-    # Build per-frame matrix for the chosen sequence
-    X_seq = df.loc[idxs, feature_cols].astype(float).values
+# Decide labels used for display
+LABELS = labels_from_artifact or user_labels or DEFAULT_LABELS
 
-    # Get per-frame probabilities (n_frames, n_labels) then aggregate to sequence (n_labels,)
-    probs_frames = estimator_predict_proba_any(model, X_seq)
-    probs_seq = aggregate_probs(probs_frames, how="mean")  # mean across frames
+# -------------------------- Tabs --------------------------
+tab_predict, tab_batch, tab_audio, tab_about = st.tabs(["🔮 Predict", "📦 Batch", "🎙️ Audio", "ℹ️ About"])
 
-    # Try to name labels. If the estimator exposes multi-class names, use them; else default.
-    labels = DEFAULT_LABELS
-    if hasattr(model, "classes_"):
-        # If classes_ is (n_classes,) and matches what you trained, you can swap it here.
-        # For multilabel wrappers, this may not map cleanly, so we keep DEFAULT_LABELS unless it's obvious.
-        if isinstance(model.classes_, (list, np.ndarray)) and len(model.classes_) == len(probs_seq):
-            labels = [str(c) for c in model.classes_]
+# -------------------------- Predict (single) --------------------------
+with tab_predict:
+    st.subheader("Single Prediction")
 
-    preds = (probs_seq >= 0.5).astype(int)
-    out_df = pd.DataFrame({"probability": probs_seq, "predicted": preds}, index=labels)
-
-    st.subheader("Predictions (stacked classifier)")
-    st.dataframe(out_df)
-
-    st.caption(
-        "Notes:\n"
-        "- We compute per-frame probabilities from your stacked classifier and **average** them to get a per-sequence prediction.\n"
-        "- If your model already performs sequence aggregation internally (e.g., trained on sequence-level features), "
-        "you can adapt the code to build those exact inputs instead of averaging frames. "
-        "Share the expected input schema if you’d like me to wire that up precisely."
+    mode = st.radio(
+        "Choose input source:",
+        options=["Pick from dataset", "Upload a CSV row"],
+        horizontal=True,
     )
 
-if __name__ == "__main__":
-    main()
+    # Thresholds (can override)
+    with st.expander("Decision Thresholds (optional)", expanded=False):
+        thresholds = {}
+        for lab in LABELS:
+            default_thr = 0.5
+            if thresholds_from_artifact and lab in thresholds_from_artifact:
+                default_thr = float(thresholds_from_artifact[lab])
+            thresholds[lab] = st.slider(f"Threshold for {lab}", 0.0, 1.0, float(default_thr), 0.01)
+
+    if mode == "Pick from dataset":
+        if dataset_df is None:
+            st.info("Provide a dataset path in the sidebar to use this mode.")
+        else:
+            # Prepare options for file_key
+            if DEFAULT_SEQ_KEY not in dataset_df.columns:
+                st.error(f"Expected '{DEFAULT_SEQ_KEY}' column in dataset.")
+            else:
+                keys = sorted(dataset_df[DEFAULT_SEQ_KEY].astype(str).unique().tolist())
+                selected_key = st.selectbox("Select a file_key", options=keys)
+
+                if st.button("Run prediction", type="primary"):
+                    try:
+                        sub = dataset_df[dataset_df[DEFAULT_SEQ_KEY].astype(str) == selected_key]
+                        if sub.empty:
+                            st.error("No rows found for the selected key.")
+                        else:
+                            # Aggregate to a single feature row
+                            row_df = aggregate_group_rows_to_single_vector(sub)
+
+                            # If artifact provides feature columns, align
+                            feat_cols = feature_cols_from_artifact
+                            if feat_cols is None:
+                                # If unknown, attempt to derive from dataset by removing meta/labels
+                                feat_cols = [c for c in row_df.columns
+                                             if c not in (DEFAULT_META_COLS + DEFAULT_LABEL_COLS)]
+
+                            X, missing, extra = align_features(row_df.copy(), feat_cols)
+                            if missing:
+                                st.warning(f"Missing columns were created as NaN (model pipeline should impute): {missing}")
+                            if extra:
+                                st.caption(f"Ignored extra columns: {extra}")
+
+                            # Predict
+                            with st.spinner("Scoring..."):
+                                proba = predict_proba_from_artifact(model_artifact, X)
+                                proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
+
+                            # Present results
+                            st.success("Prediction complete.")
+                            cols = st.columns(len(LABELS))
+                            for j, lab in enumerate(LABELS):
+                                p = proba[0, j] if proba.ndim == 2 else proba[0]
+                                dec = "POSITIVE" if p >= thresholds[lab] else "NEGATIVE"
+                                with cols[j]:
+                                    st.metric(label=f"{lab}", value=human_prob(p), delta=dec)
+
+                            with st.expander("Raw probabilities"):
+                                st.write(pd.DataFrame([proba[0]], columns=LABELS))
+                    except Exception as e:
+                        st.error(f"Prediction failed: {e}")
+
+    else:  # Upload a CSV row
+        st.write("Upload a CSV containing a single row with required features. "
+                 "If it includes 'mfcc devation', it will be parsed automatically.")
+        up = st.file_uploader("CSV file", type=["csv"])
+        if up is not None:
+            try:
+                df_u = pd.read_csv(up)
+                if len(df_u) != 1:
+                    st.warning("This mode expects exactly 1 row. If you need multiple rows, use the Batch tab.")
+                # Expand mfcc devation if present
+                df_u = expand_mfcc_dev_column(df_u, col="mfcc devation")
+                # Align features
+                feat_cols = feature_cols_from_artifact
+                if feat_cols is None:
+                    # Best effort: remove meta & labels from uploaded row
+                    feat_cols = [c for c in df_u.columns if c not in (DEFAULT_META_COLS + DEFAULT_LABEL_COLS)]
+                X, missing, extra = align_features(df_u.copy(), feat_cols)
+                if missing:
+                    st.warning(f"Missing columns were created as NaN: {missing}")
+                if extra:
+                    st.caption(f"Ignored extra columns: {extra}")
+
+                if st.button("Run prediction", type="primary"):
+                    with st.spinner("Scoring..."):
+                        proba = predict_proba_from_artifact(model_artifact, X)
+                        proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
+                    st.success("Prediction complete.")
+                    cols = st.columns(len(LABELS))
+                    for j, lab in enumerate(LABELS):
+                        p = proba[0, j] if proba.ndim == 2 else proba[0]
+                        dec = "POSITIVE" if p >= thresholds[lab] else "NEGATIVE"
+                        with cols[j]:
+                            st.metric(label=f"{lab}", value=human_prob(p), delta=dec)
+                    with st.expander("Raw probabilities"):
+                        st.write(pd.DataFrame([proba[0]], columns=LABELS))
+            except Exception as e:
+                st.error(f"Upload/parse failed: {e}")
+
+# -------------------------- Batch --------------------------
+with tab_batch:
+    st.subheader("Batch Scoring (CSV)")
+    st.write(
+        "Upload a CSV with one or more rows. If it contains multiple rows per `file_key`, "
+        "you can choose to aggregate them into a single row per key."
+    )
+    agg = st.checkbox("Aggregate by file_key (mean of numeric features)", value=True)
+    upb = st.file_uploader("Batch CSV", type=["csv"], key="batch_csv")
+
+    if upb is not None:
+        try:
+            df_b = pd.read_csv(upb)
+            # Expand mfcc devation if present
+            df_b = expand_mfcc_dev_column(df_b, col="mfcc devation")
+
+            if agg:
+                if DEFAULT_SEQ_KEY not in df_b.columns:
+                    st.error(f"Aggregation requested but '{DEFAULT_SEQ_KEY}' column not found.")
+                else:
+                    # Build one vector per key
+                    outs = []
+                    for key, grp in df_b.groupby(DEFAULT_SEQ_KEY, as_index=False):
+                        row = aggregate_group_rows_to_single_vector(grp)
+                        row[DEFAULT_SEQ_KEY] = str(key)
+                        outs.append(row)
+                    df_b = pd.concat(outs, ignore_index=True)
+
+            feat_cols = feature_cols_from_artifact
+            if feat_cols is None:
+                feat_cols = [c for c in df_b.columns if c not in (DEFAULT_META_COLS + DEFAULT_LABEL_COLS)]
+
+            X, missing, extra = align_features(df_b.copy(), feat_cols)
+            if missing:
+                st.warning(f"Missing columns created as NaN: {missing}")
+            if extra:
+                st.caption(f"Ignored extra columns: {extra}")
+
+            if st.button("Run batch prediction", type="primary"):
+                with st.spinner("Scoring batch..."):
+                    proba = predict_proba_from_artifact(model_artifact, X)
+                    proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
+                st.success("Batch prediction complete.")
+                proba_df = pd.DataFrame(proba, columns=LABELS)
+                out_df = pd.concat([df_b.reset_index(drop=True), proba_df], axis=1)
+
+                # Add decisions
+                for lab in LABELS:
+                    thr = thresholds_from_artifact.get(lab, 0.5) if thresholds_from_artifact else 0.5
+                    out_df[f"{lab}_pred"] = (out_df[lab] >= thr).astype(int)
+
+                st.dataframe(out_df.head(100), use_container_width=True)
+                df_download_button(out_df, "Download predictions CSV", "predictions.csv")
+
+        except Exception as e:
+            st.error(f"Batch scoring failed: {e}")
+
+# -------------------------- Audio --------------------------
+with tab_audio:
+    st.subheader("Predict from Audio (optional)")
+    st.write(
+        "Upload an audio file (e.g., WAV/MP3). The app will compute MFCC-based summary features "
+        "to approximate the 'mfcc devation' vector used in training."
+    )
+    if librosa is None:
+        st.warning("Audio feature extraction requires `librosa`. Please add it to requirements.")
+    else:
+        audio_file = st.file_uploader(
+            "Audio file",
+            type=["wav", "mp3", "flac", "ogg", "m4a"],
+            key="audio_upl",
+        )
+        n_mfcc = st.slider("Number of MFCC coefficients", 8, 40, 13, 1,
+                           help="This should match what was used in training; 13 is common.")
+        sr_target = st.number_input("Target sample rate (Hz)", min_value=4000, max_value=48000, value=22050, step=1000)
+
+        # Thresholds (audio tab can use same thresholds as predict tab)
+        with st.expander("Decision Thresholds (optional)", expanded=False):
+            thresholds_audio = {}
+            for lab in LABELS:
+                default_thr = 0.5
+                if thresholds_from_artifact and lab in thresholds_from_artifact:
+                    default_thr = float(thresholds_from_artifact[lab])
+                thresholds_audio[lab] = st.slider(f"Threshold for {lab}", 0.0, 1.0, float(default_thr), 0.01, key=f"thr_audio_{lab}")
+
+        def extract_mfcc_dev_from_audio(file_bytes: bytes, sr: int, n_mfcc_: int) -> pd.DataFrame:
+            """Return a single-row DataFrame with mfcc_dev_* columns."""
+            y, sr_loaded = librosa.load(io.BytesIO(file_bytes), sr=sr, mono=True)
+            # Compute MFCCs: shape (n_mfcc, n_frames)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr_loaded, n_mfcc=n_mfcc_)
+            # Deviation across frames (std deviation)
+            dev = np.std(mfcc, axis=1)
+            data = {f"mfcc_dev_{i}": dev[i] for i in range(n_mfcc_)}
+            return pd.DataFrame([data])
+
+        if audio_file is not None and st.button("Run audio prediction", type="primary"):
+            try:
+                audio_bytes = audio_file.read()
+                row_df = extract_mfcc_dev_from_audio(audio_bytes, sr_target, n_mfcc)
+                # Align to model features
+                feat_cols = feature_cols_from_artifact
+                if feat_cols is None:
+                    # If unknown, use available mfcc_dev_* columns only
+                    feat_cols = [c for c in row_df.columns if c.startswith("mfcc_dev_")]
+
+                X, missing, extra = align_features(row_df.copy(), feat_cols)
+                if missing:
+                    st.info("Some required features were missing and set to NaN; "
+                            "ensure your model pipeline includes an imputer.")
+                with st.spinner("Scoring audio..."):
+                    proba = predict_proba_from_artifact(model_artifact, X)
+                    proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
+                st.success("Prediction complete from audio.")
+
+                cols = st.columns(len(LABELS))
+                for j, lab in enumerate(LABELS):
+                    p = proba[0, j] if proba.ndim == 2 else proba[0]
+                    dec = "POSITIVE" if p >= thresholds_audio[lab] else "NEGATIVE"
+                    with cols[j]:
+                        st.metric(label=f"{lab}", value=human_prob(p), delta=dec)
+                with st.expander("Raw probabilities"):
+                    st.write(pd.DataFrame([proba[0]], columns=LABELS))
+            except Exception as e:
+                st.error(f"Audio prediction failed: {e}")
+
+# -------------------------- About --------------------------
+with tab_about:
+    st.subheader("About this app")
+    st.markdown(
+        """
+        **Purpose**  
+        This app demonstrates a heart disease prediction model. It is intended for **education and research** only.
+
+        **How it works**  
+        - Loads a merged/stacked model from a user-provided path (default shown in sidebar).
+        - Inputs can be taken from your dataset, an uploaded CSV, or from audio (which is converted to MFCC-based features).
+        - Features are aligned to what the model expects; missing features are set to NaN (your model/pipeline should impute).
+
+        **Tips**  
+        - Keep your CSV schema consistent with training.
+        - If predictions fail, check the feature list and thresholds in the model artifact.
+        - For audio-based predictions, ensure the MFCC setup matches training as closely as practical.
+
+        **Disclaimer**  
+        This application does **not** provide medical advice and must **not** be used for clinical decisions.
+        """
+    )
