@@ -93,7 +93,7 @@ if uploaded_file is not None:
         input_df = input_df.loc[:, ~input_df.columns.str.contains('^Unnamed')]
 
 
-        feature_names = joblib.load("../notebooks/feature_names.pkl")
+        feature_names = joblib.load("../models/feature_names.pkl")
         for col in feature_names:
             if col not in input_df.columns:
                 input_df[col] = 0
@@ -102,18 +102,16 @@ if uploaded_file is not None:
         # Load model and predict
         model = joblib.load("../models/final_classifier_model.pkl")
 
-        if st.button("Run Prediction. "):
+        if st.button("Run Prediction"):
             prediction = model.predict(input_df)[0]
 
+            disease_labels = ["Aortic Stenosis", "Aortic Regurgitation", "Mitral Regurgitation", "Mitral Regurgitation", "Mitral Stenosis", "Normal"]
+            predicted_diseases = [disease for disease, present in zip(disease_labels, prediction) if present == 1]
 
-        disease_labels = ["Aortic Stenosis", "Aortic Regurgitation", "Mitral Regurgitation", "Mitral Regurgitation", "Mitral Stenosis", "Normal"]
-        predicted_diseases = [disease for disease, present in zip(disease_labels, prediction) if present == 1]
-        predicted_diseases = [disease for disease, present in zip(disease_labels, prediction) if present == 1]
+            if predicted_diseases:
+                st.write("Predicted Diseases:")
+                for d in predicted_diseases:
+                    st.write(f"- {d}")
+            else:
+                st.write("No diseases predicted.")
 
-        if predicted_diseases:
-            st.write("Predicted Diseases:")
-            for d in predicted_diseases:
-                st.write(f"- {d}")
-        else:
-            st.write("No diseases predicted.")
-    
