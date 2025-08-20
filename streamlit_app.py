@@ -1,17 +1,10 @@
 # streamlit_app.py
 # ------------------------------------------------------------
 # Heart Disease Model Demo App
-#
-# Modes:
-# 1) Manual Entry (Age/Gender/Smoker/Lives + optional Audio -> MFCC features)
-# 2) Pick from dataset (extracted_features_df.csv)
-# 3) Upload CSV (single/batch)
-#
-# Model path, dataset path, and labels are configurable via the sidebar.
-# The app aligns inputs to the model's expected feature columns if present
-# in the artifact (e.g., "feature_cols"). Missing columns are set to NaN
-# so your pipeline can impute.
-#
+# - Gender encoded as 'M'/'F'
+# - Smoker encoded as 1 (Yes) / 0 (No)
+# - Optional audio → MFCC deviation features
+# - Aligns to model's feature_cols; missing set to NaN (imputer should handle)
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -31,7 +24,7 @@ try:
 except Exception:
     librosa = None
 
-# Reduce noisy HMM warnings if present in artifact
+# Quiet HMM warnings if present in artifact
 warnings.filterwarnings("ignore", message="Some rows of transmat_", module="hmmlearn")
 warnings.filterwarnings("ignore", message="invalid value encountered", module="hmmlearn")
 
@@ -53,14 +46,12 @@ DEFAULT_LABEL_COLS = ["AS", "AR", "MR", "MS", "N"]
 
 # -------------------------- Utilities --------------------------
 def parse_mfcc_dev_str(s: str) -> List[float]:
-    """Parse a string like '[0.1 0.2 0.3]' into a list of floats."""
     if pd.isna(s):
         return []
     content = str(s).strip().lstrip("[").rstrip("]")
     return [float(x) for x in content.split()] if content else []
 
 def expand_mfcc_dev_column(df: pd.DataFrame, col: str = "mfcc devation") -> pd.DataFrame:
-    """If 'mfcc devation' exists, expand it into mfcc_dev_* columns."""
     if col not in df.columns:
         return df
     parsed = df[col].apply(parse_mfcc_dev_str)
@@ -72,7 +63,6 @@ def expand_mfcc_dev_column(df: pd.DataFrame, col: str = "mfcc devation") -> pd.D
     return pd.concat([df.drop(columns=[col]), df_mfcc], axis=1)
 
 def align_features(X: pd.DataFrame, feature_cols: List[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """Align X to required feature_cols; create missing as NaN; drop extras."""
     missing = [c for c in feature_cols if c not in X.columns]
     extra = [c for c in X.columns if c not in feature_cols]
     for c in missing:
@@ -81,7 +71,6 @@ def align_features(X: pd.DataFrame, feature_cols: List[str]) -> Tuple[pd.DataFra
     return X, missing, extra
 
 def guess_feature_cols_from_artifact(model_art):
-    """Try to read feature columns from the artifact."""
     if isinstance(model_art, dict):
         if "feature_cols" in model_art:
             return list(model_art["feature_cols"])
@@ -98,13 +87,7 @@ def guess_labels_from_artifact(model_art) -> List[str]:
     return DEFAULT_LABELS
 
 def predict_proba_from_artifact(model_art, X: pd.DataFrame) -> np.ndarray:
-    """
-    Produce (n_samples, n_labels) probabilities.
-    Supports:
-    - dict bundles with callable 'predict_proba' or nested estimators
-    - scikit estimators/pipelines with predict_proba
-    """
-    # dict bundle patterns
+    # dict bundle
     if isinstance(model_art, dict):
         if "predict_proba" in model_art and callable(model_art["predict_proba"]):
             return np.asarray(model_art["predict_proba"](X))
@@ -145,14 +128,9 @@ def predict_proba_from_artifact(model_art, X: pd.DataFrame) -> np.ndarray:
         if proba.ndim == 2 and proba.shape[1] > 1:
             return proba
         return proba.reshape(-1, 1)
-
     raise RuntimeError("Loaded artifact does not expose predict_proba.")
 
 def aggregate_group_rows_to_single_vector(grp: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert many rows per file_key into a single feature row.
-    Expands 'mfcc devation' if present and averages numeric columns.
-    """
     g = expand_mfcc_dev_column(grp.copy(), col="mfcc devation")
     cols_to_skip = set(DEFAULT_META_COLS + DEFAULT_LABEL_COLS)
     num_cols = [c for c in g.columns if c not in cols_to_skip and pd.api.types.is_numeric_dtype(g[c])]
@@ -162,6 +140,81 @@ def aggregate_group_rows_to_single_vector(grp: pd.DataFrame) -> pd.DataFrame:
 
 def human_prob(p: float) -> str:
     return f"{100.0 * float(p):.1f}%"
+
+# --------- Categorical handling specific to your dataset ---------
+# Gender must be 'M'/'F'; Smoker must be 1/0.
+def apply_dataset_encodings(df: pd.DataFrame, gender_val: str | None = None, smoker_val: int | None = None) -> pd.DataFrame:
+    # Apply (or keep) Gender 'M'/'F'
+    if gender_val is not None:
+        df["Gender"] = gender_val  # keep as string so pipeline encoders can handle
+    # Apply Smoker 1/0
+    if smoker_val is not None:
+        df["Smoker"] = int(smoker_val)
+    return df
+
+def expand_or_map_categoricals(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """
+    Ensure categoricals match model expectations:
+    - If one-hot present for Gender (Gender_M/Gender_F), create those from df['Gender'] ('M'/'F').
+    - Else if 'Gender' is expected raw, pass through the 'M'/'F' string.
+    - If one-hot present for Smoker (e.g., Smoker_1/Smoker_0 or Smoker_Yes/Smoker_No), create them from int 1/0.
+    - Else if 'Smoker' is expected raw, keep as int 1/0.
+    """
+    # ----- Gender -----
+    if any(c.startswith("Gender_") for c in feature_cols):
+        # Create one-hot targets seen in feature_cols
+        oh_targets = [c for c in feature_cols if c.startswith("Gender_")]
+        for c in oh_targets:
+            df[c] = 0
+        if "Gender" in df.columns:
+            target = f"Gender_{df['Gender'].iloc[0]}"
+            if target in oh_targets:
+                df[target] = 1
+        # drop raw Gender if the model doesn't expect it
+        if "Gender" not in feature_cols and "Gender" in df.columns:
+            df.drop(columns=["Gender"], inplace=True, errors="ignore")
+    else:
+        # If model expects 'Gender', keep as 'M'/'F' string
+        if "Gender" in feature_cols and "Gender" not in df.columns:
+            df["Gender"] = "M"  # default fallback if somehow missing
+
+    # ----- Smoker -----
+    if any(c.startswith("Smoker_") for c in feature_cols):
+        oh_targets = [c for c in feature_cols if c.startswith("Smoker_")]
+        for c in oh_targets:
+            df[c] = 0
+        if "Smoker" in df.columns:
+            # Support both styles: Smoker_1/Smoker_0 or Smoker_Yes/Smoker_No
+            val = int(df["Smoker"].iloc[0])
+            t1 = f"Smoker_{val}"
+            t2 = "Smoker_Yes" if val == 1 else "Smoker_No"
+            if t1 in oh_targets:
+                df[t1] = 1
+            elif t2 in oh_targets:
+                df[t2] = 1
+        if "Smoker" not in feature_cols and "Smoker" in df.columns:
+            df.drop(columns=["Smoker"], inplace=True, errors="ignore")
+    else:
+        # If raw 'Smoker' expected, keep 1/0
+        if "Smoker" in feature_cols and "Smoker" not in df.columns:
+            df["Smoker"] = 0
+
+    return df
+
+def coerce_numerics_except_expected_categoricals(X: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
+    """
+    Convert columns to numeric EXCEPT raw categorical columns the model may expect as strings
+    (e.g., 'Gender' and optionally 'Lives').
+    """
+    keep_as_object = set()
+    for cand in ("Gender", "Lives"):
+        if cand in feature_cols and cand in X.columns:
+            keep_as_object.add(cand)
+
+    for c in X.columns:
+        if c not in keep_as_object:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    return X
 
 # -------------------------- Caching --------------------------
 @st.cache_resource(show_spinner=False)
@@ -175,8 +228,8 @@ def load_csv_cached(path: str) -> pd.DataFrame:
 # -------------------------- Sidebar --------------------------
 st.title("🫀 Heart Disease Model — Interactive Demo")
 st.markdown(
-    "Manipulate **patient inputs** like Age, Gender, Smoker, and optionally upload **audio** to "
-    "generate MFCC features for prediction with your **merged ensemble model**.\n\n"
+    "Enter **patient inputs** (Age, Gender `M/F`, Smoker `1/0`) and optionally upload **audio** "
+    "to generate MFCC features for your **merged ensemble model**.\n\n"
     "**Disclaimer:** Educational/research use only — not a medical device."
 )
 
@@ -184,7 +237,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
     model_path = st.text_input(
         "Model file path",
-        value="models/final_stacked_classifier_model.pkl",
+        value="final_stacked_classifier_model.pkl",
         help="Path to your merged model artifact.",
     )
     dataset_path = st.text_input(
@@ -236,18 +289,18 @@ tab_manual, tab_dataset, tab_csv, tab_about = st.tabs(
 with tab_manual:
     st.subheader("Patient Inputs (manual) + Optional Audio")
 
-    # Patient inputs
+    # Patient inputs (Gender M/F, Smoker 1/0)
     colA, colB, colC, colD = st.columns(4)
     with colA:
         age = st.number_input("Age", min_value=0, max_value=120, value=60, step=1)
     with colB:
-        gender = st.selectbox("Gender", options=["Male", "Female", "Other", "Unknown"], index=0)
+        gender = st.radio("Gender", options=["M", "F"], index=0, horizontal=True)
     with colC:
-        smoker = st.selectbox("Smoker", options=["No", "Yes", "Unknown"], index=0)
+        smoker_flag = st.radio("Smoker (1=yes, 0=no)", options=[1, 0], index=1, horizontal=True)
     with colD:
-        lives = st.selectbox("Lives (region)", options=["Urban", "Suburban", "Rural", "Unknown"], index=0)
+        lives = st.selectbox("Lives (region)", options=["Urban", "Suburban", "Rural"], index=0)
 
-    # Optional audio upload -> create mfcc_dev_* features
+    # Optional audio → MFCC deviation features
     st.markdown("**Optional:** Upload an audio file to extract MFCC deviation features.")
     if librosa is None:
         st.warning("Audio feature extraction requires `librosa`. Please add it to requirements.")
@@ -261,9 +314,8 @@ with tab_manual:
         with col3:
             sr_target = st.number_input("Sample rate (Hz)", min_value=4000, max_value=48000, value=22050, step=1000)
 
-    # Optional: show/override any additional numeric features the model expects
     with st.expander("Advanced: Add/override extra numeric features (optional)"):
-        st.caption("If your model expects more inputs (e.g., engineered features), you can supply them here.")
+        st.caption("If your model expects more engineered features, you can add them here.")
         extra_kv = st.data_editor(
             pd.DataFrame({"feature": [], "value": []}),
             num_rows="dynamic",
@@ -272,15 +324,13 @@ with tab_manual:
         )
 
     def make_manual_row_df() -> pd.DataFrame:
-        """Build a single-row DataFrame from manual widgets + optional audio MFCCs."""
         row = {
             "Age": age,
-            "Gender": gender,
-            "Smoker": smoker,
-            "Lives": lives,
+            "Gender": gender,        # 'M'/'F'
+            "Smoker": smoker_flag,   # 1/0
+            "Lives": lives,          # string; only kept if model expects it raw
         }
-
-        # Add extra numeric features from editor
+        # Add extra numeric features
         if isinstance(extra_kv, pd.DataFrame) and {"feature", "value"}.issubset(extra_kv.columns):
             for _, r in extra_kv.iterrows():
                 f = str(r.get("feature", "")).strip()
@@ -288,13 +338,13 @@ with tab_manual:
                     try:
                         row[f] = float(r.get("value"))
                     except Exception:
-                        # Keep raw string if not convertible
                         row[f] = r.get("value")
 
         # Add MFCC deviation features if audio provided
         if librosa is not None and audio_file is not None:
             try:
-                y, sr = librosa.load(io.BytesIO(audio_file.read()), sr=sr_target, mono=True)
+                audio_bytes = audio_file.read()
+                y, sr = librosa.load(io.BytesIO(audio_bytes), sr=sr_target, mono=True)
                 mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)   # (n_mfcc, n_frames)
                 dev = np.std(mfcc, axis=1)                               # deviation across frames
                 for i in range(n_mfcc):
@@ -307,29 +357,32 @@ with tab_manual:
     if st.button("Run prediction", type="primary"):
         try:
             row_df = make_manual_row_df()
-
-            # If dataset-like "mfcc devation" text were present, expand (unlikely in manual)
             row_df = expand_mfcc_dev_column(row_df, col="mfcc devation")
 
-            # Determine feature columns to align to
             feat_cols = feature_cols_from_artifact
             if feat_cols is None:
-                # Best guess: use all columns except labels if any
                 feat_cols = [c for c in row_df.columns if c not in DEFAULT_LABEL_COLS]
 
+            # Apply dataset encodings (ensure Gender 'M'/'F', Smoker 1/0)
+            row_df = apply_dataset_encodings(row_df, gender_val=gender, smoker_val=smoker_flag)
+            # Expand to model expectations (one-hot vs raw)
+            row_df = expand_or_map_categoricals(row_df, feat_cols)
+
+            # Align features
             X_aligned, missing, extra = align_features(row_df.copy(), feat_cols)
             if missing:
                 st.info(f"Missing features were set to NaN (pipeline should impute): {missing}")
             if extra:
                 st.caption(f"Ignored extra columns: {extra}")
 
+            # Coerce numerics but keep expected raw categoricals as strings
+            X_aligned = coerce_numerics_except_expected_categoricals(X_aligned, feat_cols)
+
             with st.spinner("Scoring..."):
                 proba = predict_proba_from_artifact(model_artifact, X_aligned)
                 proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
 
-            # Decisions use thresholds from artifact if available, else 0.5
             thresholds = thresholds_from_artifact or {lab: 0.5 for lab in LABELS}
-
             st.success("Prediction complete.")
             cols = st.columns(len(LABELS))
             for j, lab in enumerate(LABELS):
@@ -363,14 +416,20 @@ with tab_dataset:
                         st.error("No rows found for the selected key.")
                     else:
                         row_df = aggregate_group_rows_to_single_vector(sub)
-
-                        # Expand if string-based MFCC exists
                         row_df = expand_mfcc_dev_column(row_df, col="mfcc devation")
 
-                        feat_cols = feature_cols_from_artifact
-                        if feat_cols is None:
-                            # Derive by removing obvious label columns from this aggregate row
-                            feat_cols = [c for c in row_df.columns if c not in DEFAULT_LABEL_COLS]
+                        feat_cols = feature_cols_from_artifact or [c for c in row_df.columns if c not in DEFAULT_LABEL_COLS]
+
+                        # Try to enforce dataset encodings if columns present
+                        if "Gender" in row_df.columns:
+                            gval = str(row_df["Gender"].iloc[0])
+                            gval = "M" if gval.upper().startswith("M") else "F"
+                        else:
+                            gval = None
+                        sval = int(row_df["Smoker"].iloc[0]) if "Smoker" in row_df.columns else None
+                        row_df = apply_dataset_encodings(row_df, gender_val=gval, smoker_val=sval)
+
+                        row_df = expand_or_map_categoricals(row_df, feat_cols)
 
                         X, missing, extra = align_features(row_df.copy(), feat_cols)
                         if missing:
@@ -378,12 +437,13 @@ with tab_dataset:
                         if extra:
                             st.caption(f"Ignored extras: {extra}")
 
+                        X = coerce_numerics_except_expected_categoricals(X, feat_cols)
+
                         with st.spinner("Scoring..."):
                             proba = predict_proba_from_artifact(model_artifact, X)
                             proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
 
                         thresholds = thresholds_from_artifact or {lab: 0.5 for lab in LABELS}
-
                         st.success("Prediction complete.")
                         cols = st.columns(len(LABELS))
                         for j, lab in enumerate(LABELS):
@@ -418,15 +478,23 @@ with tab_csv:
                     outs.append(row)
                 df_u = pd.concat(outs, ignore_index=True)
 
-            feat_cols = feature_cols_from_artifact
-            if feat_cols is None:
-                feat_cols = [c for c in df_u.columns if c not in DEFAULT_LABEL_COLS]
+            feat_cols = feature_cols_from_artifact or [c for c in df_u.columns if c not in DEFAULT_LABEL_COLS]
+
+            # Enforce dataset encodings if raw columns exist
+            if "Gender" in df_u.columns:
+                df_u["Gender"] = df_u["Gender"].astype(str).str.upper().map(lambda x: "M" if x.startswith("M") else "F")
+            if "Smoker" in df_u.columns:
+                df_u["Smoker"] = pd.to_numeric(df_u["Smoker"], errors="coerce").fillna(0).astype(int)
+
+            df_u = expand_or_map_categoricals(df_u, feat_cols)
 
             X, missing, extra = align_features(df_u.copy(), feat_cols)
             if missing:
                 st.info(f"Missing features created as NaN: {missing}")
             if extra:
                 st.caption(f"Ignored extras: {extra}")
+
+            X = coerce_numerics_except_expected_categoricals(X, feat_cols)
 
             if st.button("Run CSV prediction", type="primary"):
                 with st.spinner("Scoring..."):
@@ -444,7 +512,6 @@ with tab_csv:
                 st.success("Batch prediction complete.")
                 st.dataframe(out_df.head(100), use_container_width=True)
 
-                # Download
                 csv_bytes = out_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "Download predictions CSV",
@@ -461,19 +528,15 @@ with tab_about:
     st.subheader("About this app")
     st.markdown(
         """
-        **Purpose**  
-        This app demonstrates a merged heart disease classifier. Users can adjust patient
-        inputs (Age, Gender, Smoker, Lives) and optionally upload audio that is converted to
-        MFCC deviation features.
+        **Inputs & Encoding**
+        - **Gender**: `'M'` or `'F'` (kept as string if your pipeline encodes it internally, or expanded to one-hot if the model expects `Gender_M`/`Gender_F`).
+        - **Smoker**: `1` (Yes) or `0` (No). Also expanded to one-hot if your model expects it.
+        - **Audio**: Optional upload — we compute MFCC deviation features (`mfcc_dev_*`).
 
-        **How inputs are handled**  
-        - The app tries to align inputs to the model’s expected `feature_cols` found in the
-          artifact. Any missing features are set to NaN (your preprocessing should impute).
-        - Categorical fields (Gender/Smoker/Lives) are passed as strings; your pipeline should
-          include encoders (e.g., OneHotEncoder). If your model expects numeric encodings,
-          adjust the manual fields or add mappings in the Advanced section.
+        **Feature Alignment**
+        - We read `feature_cols` from your artifact if present. Missing features are created as `NaN` so your imputer can fill them.
 
         **Disclaimer**  
-        Not a medical device. For educational and research use only.
+        Not a medical device. For educational/research use only.
         """
     )
