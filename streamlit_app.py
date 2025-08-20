@@ -316,7 +316,7 @@ st.markdown(
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    model_path = st.text_input("Model file path", "model/final_stacked_classifier_model.pkl")
+    model_path = st.text_input("Model file path", "models/final_stacked_classifier_model.pkl")
     dataset_path = st.text_input("Dataset CSV (optional)", "extracted_features_df.csv")
     labels_input = st.text_input("Label names (comma-separated)", "AS,AR,MR,MS,N")
     user_labels = [x.strip() for x in labels_input.split(",") if x.strip()] or DEFAULT_LABELS
