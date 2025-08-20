@@ -184,7 +184,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
     model_path = st.text_input(
         "Model file path",
-        value="final_stacked_classifier_model.pkl",
+        value="models/final_stacked_classifier_model.pkl",
         help="Path to your merged model artifact.",
     )
     dataset_path = st.text_input(
