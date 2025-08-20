@@ -1,10 +1,11 @@
 # streamlit_app.py
 # ------------------------------------------------------------
 # Heart Disease Model Demo App
-# - Optional audio: compute many common audio features expected by your pipeline
-# - Gender UI uses 'M'/'F', with safe fallback to numeric if pipeline needs it
+# - Optional audio: compute many audio features expected by your pipeline
+# - Auto-impute missing values (dataset means -> 0.0) for models like GB that reject NaN
+# - Gender UI uses 'M'/'F', with safe numeric fallback if pipeline needs it
 # - Smoker UI uses 1/0
-# - Aligns to artifact feature_cols, fills missing with NaN (imputer should handle)
+# - Aligns to artifact feature_cols; extra columns are ignored
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -62,7 +63,6 @@ def parse_mfcc_dev_str(s: str) -> List[float]:
     return [float(x) for x in content.split()] if content else []
 
 def expand_mfcc_dev_column(df: pd.DataFrame, col: str = "mfcc devation") -> pd.DataFrame:
-    # Parse existing "mfcc devation" column into mfcc_dev_* columns if present
     if col not in df.columns:
         return df
     parsed = df[col].apply(parse_mfcc_dev_str)
@@ -98,7 +98,7 @@ def guess_labels_from_artifact(model_art) -> List[str]:
     return DEFAULT_LABELS
 
 def predict_proba_from_artifact(model_art, X: pd.DataFrame) -> np.ndarray:
-    # Dictionary bundle?
+    # Dict bundle?
     if isinstance(model_art, dict):
         if "predict_proba" in model_art and callable(model_art["predict_proba"]):
             return np.asarray(model_art["predict_proba"](X))
@@ -113,7 +113,6 @@ def predict_proba_from_artifact(model_art, X: pd.DataFrame) -> np.ndarray:
 
 def _normalize_proba(proba) -> np.ndarray:
     proba = np.asarray(proba)
-    # Multi-label pipeline sometimes returns list-of-arrays
     if isinstance(proba, list):
         cols = []
         for arr in proba:
@@ -123,7 +122,6 @@ def _normalize_proba(proba) -> np.ndarray:
             else:
                 cols.append(arr.ravel())
         return np.column_stack(cols)
-    # HMM-like (n, classes, 2) -> take pos class
     if proba.ndim == 3:
         return np.transpose(proba[:, :, 1])
     if proba.ndim == 1:
@@ -170,7 +168,6 @@ def expand_or_map_categoricals(df: pd.DataFrame, feature_cols: List[str]) -> pd.
     return df
 
 def coerce_numerics_except_expected_categoricals(X: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    # Keep object for raw categoricals only if model expects them as strings
     keep_as_object = set()
     for cand in ("Gender", "Lives"):
         if cand in feature_cols and cand in X.columns:
@@ -181,15 +178,12 @@ def coerce_numerics_except_expected_categoricals(X: pd.DataFrame, feature_cols: 
     return X
 
 def force_numeric_categoricals_if_needed(X: pd.DataFrame) -> pd.DataFrame:
-    """Fallback if model complains about strings: map common categoricals to numeric codes."""
     X = X.copy()
     if "Gender" in X.columns and X["Gender"].dtype == object:
         X["Gender"] = X["Gender"].map({"M": 1, "F": 0}).fillna(0).astype(float)
-    # Simple ordinal mapping for Lives if present and object
     if "Lives" in X.columns and X["Lives"].dtype == object:
         ord_map = {"Rural": 0.0, "Suburban": 1.0, "Urban": 2.0}
         X["Lives"] = X["Lives"].map(ord_map).fillna(1.0).astype(float)
-    # Any other unexpected object columns -> factorize to stable integers
     for c in X.columns:
         if X[c].dtype == object:
             codes, _ = pd.factorize(X[c].astype(str))
@@ -198,7 +192,6 @@ def force_numeric_categoricals_if_needed(X: pd.DataFrame) -> pd.DataFrame:
 
 # -------------------------- Audio feature extraction --------------------------
 def compute_audio_features(y: np.ndarray, sr: int, n_mfcc: int = 13) -> Dict[str, float]:
-    """Compute a set of common features whose names match your training columns where possible."""
     feats: Dict[str, float] = {}
 
     # Zero Crossing Rate (mean)
@@ -229,7 +222,7 @@ def compute_audio_features(y: np.ndarray, sr: int, n_mfcc: int = 13) -> Dict[str
     except Exception:
         feats["Mean Spectral Bandwidth"] = np.nan
 
-    # Spectral contrast (avg over bands)
+    # Spectral contrast
     try:
         scontrast = librosa.feature.spectral_contrast(y=y, sr=sr)
         feats["Mean Spectral Contrast"] = float(scontrast.mean())
@@ -267,19 +260,16 @@ def compute_audio_features(y: np.ndarray, sr: int, n_mfcc: int = 13) -> Dict[str
     try:
         mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=max(13, n_mfcc))
         feats["mfcc length"] = float(mfcc.shape[1])
-        # Means / stddevs for first 4 MFCCs to match typical columns
         for i in range(4):
             feats[f"mfcc{i+1}_sma3_amean"] = float(mfcc[i, :].mean())
             feats[f"mfcc{i+1}_sma3_stddevNorm"] = float(mfcc[i, :].std())
-        # Deviation (std) per-coefficient as mfcc_dev_i
         dev = np.std(mfcc, axis=1)
         for i in range(dev.shape[0]):
             feats[f"mfcc_dev_{i}"] = float(dev[i])
     except Exception:
-        # still include the MFCC names if they might be required
         feats["mfcc length"] = np.nan
 
-    # Features we can't compute easily here (leave NaN; imputer should handle)
+    # Fields we cannot compute without OpenSMILE -> leave NaN; imputer will fill
     for impossible in [
         "loudness_sma3_amean", "loudness_sma3_stddevNorm",
         "loudness_sma3_percentile20.0", "loudness_sma3_percentile50.0",
@@ -306,18 +296,88 @@ def load_model_resource(path: str):
 def load_csv_cached(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
+# -------------------------- NEW: Imputation helpers --------------------------
+def compute_fill_values(feature_cols: List[str], dataset_df: Optional[pd.DataFrame]) -> pd.Series:
+    """Mean of numeric columns from reference dataset; default 0.0 if not available."""
+    fill = pd.Series(0.0, index=pd.Index(feature_cols, dtype=object))
+    if dataset_df is not None:
+        # try to use dataset means when column present & numeric
+        for c in feature_cols:
+            if c in dataset_df.columns:
+                try:
+                    fill[c] = pd.to_numeric(dataset_df[c], errors="coerce").mean()
+                    if np.isnan(fill[c]):
+                        fill[c] = 0.0
+                except Exception:
+                    fill[c] = 0.0
+    # also add harmless default for common meta index
+    if "Unnamed: 0" in fill.index and np.isnan(fill["Unnamed: 0"]):
+        fill["Unnamed: 0"] = 0.0
+    return fill
+
+def impute_locally(X: pd.DataFrame, fill_values: pd.Series) -> pd.DataFrame:
+    Z = X.copy()
+    # Ensure numeric dtypes (objects -> numeric codes where needed)
+    for c in Z.columns:
+        if Z[c].dtype == object:
+            codes, _ = pd.factorize(Z[c].astype(str))
+            Z[c] = codes.astype(float)
+    # Align fill_values
+    fv = fill_values.reindex(Z.columns)
+    Z = Z.fillna(fv)
+    # Any remaining NaN -> 0.0
+    Z = Z.fillna(0.0)
+    return Z
+
+def attempt_predict_with_fallbacks(model_artifact, X: pd.DataFrame,
+                                   dataset_df: Optional[pd.DataFrame],
+                                   thresholds_from_artifact: Optional[Dict[str, float]],
+                                   LABELS: List[str]) -> Tuple[np.ndarray, Dict[str, float], Optional[str]]:
+    """Try normal prediction; if errors mention strings or NaNs, apply fallbacks."""
+    # 1) Try as-is
+    try:
+        proba = predict_proba_from_artifact(model_artifact, X)
+        return np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0), (thresholds_from_artifact or {lab: 0.5 for lab in LABELS}), None
+    except Exception as e1:
+        msg1 = str(e1)
+
+    # 2) If string conversion issue -> force numeric categoricals
+    if re.search(r"could not convert string to float", msg1, flags=re.I):
+        X2 = force_numeric_categoricals_if_needed(X)
+        try:
+            proba = predict_proba_from_artifact(model_artifact, X2)
+            return np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0), (thresholds_from_artifact or {lab: 0.5 for lab in LABELS}), "Converted categoricals to numeric."
+        except Exception as e2:
+            msg2 = str(e2)
+            # fall through to imputation if NaN complaint persists
+            msg1 = msg1 + " | " + msg2
+
+    # 3) If NaN complaint -> local imputation (dataset means -> 0.0)
+    if re.search(r"Input X contains NaN", msg1, flags=re.I) or re.search(r"NaN", msg1, flags=re.I):
+        fill_values = compute_fill_values(list(X.columns), dataset_df)
+        X3 = impute_locally(X, fill_values)
+        try:
+            proba = predict_proba_from_artifact(model_artifact, X3)
+            note = "Imputed missing values (dataset means, fallback 0.0)."
+            return np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0), (thresholds_from_artifact or {lab: 0.5 for lab in LABELS}), note
+        except Exception as e3:
+            raise RuntimeError(f"Prediction failed even after imputation. Last error: {e3}") from e3
+
+    # Otherwise fail with original error
+    raise RuntimeError(f"Prediction failed: {msg1}")
+
 # -------------------------- UI --------------------------
 st.title("🫀 Heart Disease Model — Interactive Demo")
 st.markdown(
     "Enter **patient inputs** and optionally upload an **audio file**. "
-    "The app computes many audio features your model expects. "
-    "**Note:** Educational use only."
+    "If audio is not provided, the app will **impute** audio features using dataset means or 0.0 "
+    "so models like Gradient Boosting can still run. **Educational use only.**"
 )
 
 with st.sidebar:
     st.header("⚙️ Settings")
     model_path = st.text_input("Model file path", "models/final_stacked_classifier_model.pkl")
-    dataset_path = st.text_input("Dataset CSV (optional)", "extracted_features_df.csv")
+    dataset_path = st.text_input("Dataset CSV (optional for imputation)", "extracted_features_df.csv")
     labels_input = st.text_input("Label names (comma-separated)", "AS,AR,MR,MS,N")
     user_labels = [x.strip() for x in labels_input.split(",") if x.strip()] or DEFAULT_LABELS
 
@@ -345,7 +405,7 @@ if dataset_path.strip():
     try:
         dataset_df = load_csv_cached(dataset_path.strip())
     except Exception as e:
-        st.warning(f"Could not load dataset CSV: {e}")
+        st.info(f"Could not load dataset CSV (imputation will fall back to zeros): {e}")
 
 LABELS = labels_from_artifact or user_labels or DEFAULT_LABELS
 
@@ -387,8 +447,6 @@ with tab_manual:
             "Smoker": smoker_flag, # 1/0
             "Lives": lives,
         }
-
-        # If audio present, compute feature set
         if librosa is not None and audio_file is not None:
             try:
                 audio_bytes = audio_file.read()
@@ -397,7 +455,6 @@ with tab_manual:
                 row.update(audio_feats)
             except Exception as e:
                 st.error(f"Audio processing failed: {e}")
-
         return pd.DataFrame([row])
 
     if st.button("Run prediction", type="primary"):
@@ -407,7 +464,6 @@ with tab_manual:
 
             feat_cols = feature_cols_from_artifact
             if feat_cols is None:
-                # Fallback guess (if artifact doesn't specify)
                 feat_cols = [c for c in row_df.columns if c not in DEFAULT_LABEL_COLS]
 
             # Enforce dataset encodings (M/F, 1/0)
@@ -424,21 +480,14 @@ with tab_manual:
 
             X_aligned = coerce_numerics_except_expected_categoricals(X_aligned, feat_cols)
 
-            # Try prediction; if it complains about strings, fallback-encode categoricals to numeric and retry.
-            try:
-                with st.spinner("Scoring..."):
-                    proba = predict_proba_from_artifact(model_artifact, X_aligned)
-            except Exception as e:
-                msg = str(e)
-                if re.search(r"could not convert string to float", msg, flags=re.I):
-                    X_numeric = force_numeric_categoricals_if_needed(X_aligned)
-                    with st.spinner("Scoring (with numeric fallback)..."):
-                        proba = predict_proba_from_artifact(model_artifact, X_numeric)
-                else:
-                    raise
+            # Try prediction with smart fallbacks (string->numeric, then impute if NaN)
+            with st.spinner("Scoring..."):
+                proba, thresholds, note = attempt_predict_with_fallbacks(
+                    model_artifact, X_aligned, dataset_df, thresholds_from_artifact, LABELS
+                )
 
-            proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
-            thresholds = thresholds_from_artifact or {lab: 0.5 for lab in LABELS}
+            if note:
+                st.caption(note)
 
             st.success("Prediction complete.")
             cols = st.columns(len(LABELS))
@@ -478,13 +527,11 @@ with tab_dataset:
                         row_df = (g.mean(axis=0, skipna=True).to_frame().T
                                   if not g.empty else sub.iloc[[0]].drop(columns=DEFAULT_LABEL_COLS, errors="ignore"))
 
-                        # Try to carry over simple categoricals if present
                         for c in ("Age", "Gender", "Smoker", "Lives"):
                             if c in sub.columns and c not in row_df.columns:
                                 row_df[c] = sub[c].iloc[0]
 
                         row_df = expand_mfcc_dev_column(row_df, col="mfcc devation")
-
                         feat_cols = feature_cols_from_artifact or [c for c in row_df.columns if c not in DEFAULT_LABEL_COLS]
 
                         # Normalize encodings
@@ -503,19 +550,13 @@ with tab_dataset:
 
                         X = coerce_numerics_except_expected_categoricals(X, feat_cols)
 
-                        try:
-                            with st.spinner("Scoring..."):
-                                proba = predict_proba_from_artifact(model_artifact, X)
-                        except Exception as e:
-                            if re.search(r"could not convert string to float", str(e), flags=re.I):
-                                X = force_numeric_categoricals_if_needed(X)
-                                with st.spinner("Scoring (with numeric fallback)..."):
-                                    proba = predict_proba_from_artifact(model_artifact, X)
-                            else:
-                                raise
+                        with st.spinner("Scoring..."):
+                            proba, thresholds, note = attempt_predict_with_fallbacks(
+                                model_artifact, X, dataset_df, thresholds_from_artifact, LABELS
+                            )
 
-                        proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
-                        thresholds = thresholds_from_artifact or {lab: 0.5 for lab in LABELS}
+                        if note:
+                            st.caption(note)
 
                         st.success("Prediction complete.")
                         cols = st.columns(len(LABELS))
@@ -573,22 +614,17 @@ with tab_csv:
             X = coerce_numerics_except_expected_categoricals(X, feat_cols)
 
             if st.button("Run CSV prediction", type="primary"):
-                try:
-                    with st.spinner("Scoring..."):
-                        proba = predict_proba_from_artifact(model_artifact, X)
-                except Exception as e:
-                    if re.search(r"could not convert string to float", str(e), flags=re.I):
-                        X = force_numeric_categoricals_if_needed(X)
-                        with st.spinner("Scoring (with numeric fallback)..."):
-                            proba = predict_proba_from_artifact(model_artifact, X)
-                    else:
-                        raise
+                with st.spinner("Scoring..."):
+                    proba, thresholds, note = attempt_predict_with_fallbacks(
+                        model_artifact, X, dataset_df, thresholds_from_artifact, LABELS
+                    )
 
-                proba = np.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0)
+                if note:
+                    st.caption(note)
+
                 proba_df = pd.DataFrame(proba, columns=LABELS)
                 out_df = pd.concat([df_u.reset_index(drop=True), proba_df], axis=1)
 
-                thresholds = thresholds_from_artifact or {lab: 0.5 for lab in LABELS}
                 for lab in LABELS:
                     thr = float(thresholds.get(lab, 0.5))
                     out_df[f"{lab}_pred"] = (out_df[lab] >= thr).astype(int)
@@ -613,16 +649,16 @@ with tab_about:
     st.markdown(
         """
         **Inputs & Encoding**
-        - **Gender**: `'M'` / `'F'` in the UI. If your model expects numeric, the app will fallback to `M→1, F→0`.
+        - **Gender**: `'M'` / `'F'`. If your model expects numeric, the app will fallback to `M→1, F→0`.
         - **Smoker**: `1` (Yes) / `0` (No).
         - **Audio (optional)**: The app computes many features your model likely expects:
           Zero Crossing Rate, RMS mean/std/skew, Spectral Centroid/Bandwidth/Contrast,
           Mel spectrogram mean/std, CQT mean/std/skew, Spectral Flux, MFCC means/std for first 4 bands,
-          `mfcc_dev_*`, and `mfcc length`. Some OpenSMILE-specific features remain NaN and should be imputed.
+          `mfcc_dev_*`, and `mfcc length`. OpenSMILE-specific fields remain NaN.
 
-        **Feature Alignment**
-        - If your model artifact provides `feature_cols`, the app aligns to them.
-          Any missing columns are created as `NaN` so your imputer can fill them.
+        **Imputation**
+        - If your pipeline doesn't impute internally (e.g., Gradient Boosting), the app will impute:
+          dataset column means when available, otherwise `0.0`. This enables prediction without audio.
 
         **Disclaimer**  
         Not a medical device. For educational/research use only.
