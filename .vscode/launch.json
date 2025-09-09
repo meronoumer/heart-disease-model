@@ -13,7 +13,9 @@
             "module": "streamlit.cli",
             "args": [
                 "run",
-                "${file}$"
+                "${file}$",
+                "--server.port",
+                "8008"
             ]
         }
     ]
