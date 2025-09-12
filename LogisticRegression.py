@@ -1,7 +1,7 @@
 #Heart Disease Project AI4ALL, July 2025
 # Author: Natalie Hicks
 #Logistic Regression using sklearn
-
+import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -105,10 +105,7 @@ def predict_from_features():
             print("Invalid input. Please enter numbers only, separated by commas.")
         except Exception as e:
             print(f"An error occurred: {str(e)}")
-
-
-
-
+            
 # Run interactive prediction for user
 while True:
     predict_from_features()
@@ -116,3 +113,7 @@ while True:
         print("Prediction session ended.")
         break
 
+filename = 'logistic_regression_model.pkl'
+
+with open(filename, 'wb') as file:
+    pickle.dump(model, file)
