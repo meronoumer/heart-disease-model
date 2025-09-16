@@ -104,7 +104,7 @@ def _bundle_get(bundle: Any, *keys, default=None):
 
 @st.cache_resource
 def load_artifacts_from_bundle(
-    bundle_path: str | Path = "artifacts/final_stacked_model_bundle.pkl",
+    bundle_path: str | Path = "artifacts/final_stacked_classifier_model_bundle.pkl",
 ):
     """
     Load pipeline/model + feature list + stats from a single bundle.
