@@ -195,7 +195,7 @@ def main():
 
     # ---------- Load bundle ----------
     try:
-        art = load_artifacts_from_bundle("artifacts/final_stacked_model_bundle.pkl")
+        art = load_artifacts_from_bundle("artifacts/final_stacked_classifier_model_bundle.pkl")
     except Exception as e:
         st.error(f"Could not load model bundle: {e}")
         st.stop()
