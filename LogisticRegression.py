@@ -12,8 +12,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, hamming_loss, accuracy_score
 
 # Read data from path, using my path rn so change before running
-df = pd.read_csv(Path('C:/Users/natal/Downloads/extracted_features_df.csv'))
-
+df = pd.read_csv("extracted_features_df.csv")
 # Define non-feature columns
 non_feature_cols = [
     'Unnamed: 0', 'patient_id_x', 'file_key', 'audio_filename_base',
@@ -61,57 +60,7 @@ print(f"Exact Match Accuracy: {accuracy_score(y_test, y_pred):.4f}")
 
 
 # Interactive Prediction Section (Was using for testing right now but is not finalized to account for everything we need)
-def predict_from_features():
-    print("\n" + "=" * 50)
-    print("DISEASE PREDICTION FROM AUDIO FEATURES")
-    print("=" * 50)
-    print(f"\nPlease enter all {len(feature_names)} feature values at once, separated by commas.")
-    print("Example: 12.5, 0.04, 1500, -5.2, ... (and so on for all features)\n")
-
-    while True:
-        try:
-            input_str = input("Enter all feature values: ")
-            input_values = [float(x.strip()) for x in input_str.split(',')]
-
-            if len(input_values) != len(feature_names):
-                print(f"Error: Expected {len(feature_names)} values, got {len(input_values)}")
-                continue
-
-            input_array = np.array(input_values).reshape(1, -1)
-            input_scaled = scaler.transform(input_array)
-
-            # Make prediction
-            prediction = model.predict(input_scaled)
-            proba = model.predict_proba(input_scaled)
-
-            # Convert to disease names
-            predicted_diseases = mlb.inverse_transform(prediction)
-            diseases_list = predicted_diseases[0] if len(predicted_diseases[0]) > 0 else ['Normal (N)']
-
-            # Get probabilities
-            disease_probs = {disease: f"{proba[i][0][1] * 100:.1f}%" for i, disease in enumerate(mlb.classes_)}
-
-            # Display results
-            print("\n" + "=" * 50)
-            print("PREDICTION RESULTS:")
-            print(f"Predicted Conditions: {', '.join(diseases_list)}")
-            print("\nProbability Estimates:")
-            for disease, prob in disease_probs.items():
-                print(f"{disease}: {prob}")
-            print("=" * 50)
-            break
-
-        except ValueError:
-            print("Invalid input. Please enter numbers only, separated by commas.")
-        except Exception as e:
-            print(f"An error occurred: {str(e)}")
-            
-# Run interactive prediction for user
-while True:
-    predict_from_features()
-    if input("\nPredict another sample? (y/n): ").lower() != 'y':
-        print("Prediction session ended.")
-        break
+#
 
 filename = 'logistic_regression_model.pkl'
 

@@ -1,7 +1,7 @@
 #Heart Disease Project AI4ALL, August 2025
 # Author: Natalie Hicks
 #Logistic Regression using sklearn
-
+import pickle
 import pandas as pd
 from pathlib import Path
 from sklearn.multioutput import MultiOutputClassifier
@@ -10,12 +10,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, hamming_loss, accuracy_score
 
 #Load data from csv files
-df = pd.read_csv(Path('extracted_features_df.csv'))
+df = pd.read_csv("extracted_features_df.csv")
 
-X_train = pd.read_csv(Path('X_train.csv'))
-X_test = pd.read_csv(Path('X_test.csv'))
-y_train = pd.read_csv(Path('y_train.csv'))
-y_test = pd.read_csv(Path('y_test.csv'))
+X_train = pd.read_csv("data/X_train.csv")
+X_test = pd.read_csv("data/X_test.csv")
+y_train = pd.read_csv("data/y_train.csv")
+y_test = pd.read_csv("data/y_test.csv")
 
 scaler = StandardScaler()
 
@@ -50,5 +50,8 @@ print("Model Evaluation:")
 print(classification_report(y_test, y_pred, target_names=['AS', 'AR', 'MR', 'MS', 'N'], zero_division=0))
 print(f"\nHamming Loss: {hamming_loss(y_test, y_pred):.4f}")
 print(f"Exact Match Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+filename = 'logistic_regression_model.pkl'
 
+with open(filename, 'wb') as file:
+    pickle.dump(model, file)
 

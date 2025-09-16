@@ -241,7 +241,7 @@ st.markdown(
 
 with st.sidebar:
     st.header("Settings")
-    default_model_path = "models/final_stacked_classifier_model.bundle.pkl"
+    default_model_path = "notebooks/final_stacked_classifier_model.bundle.pkl"
     model_path = st.text_input("Model file path", value=default_model_path)
     show_expected_cols = st.checkbox("Show expected feature columns after loading", value=False)
 
