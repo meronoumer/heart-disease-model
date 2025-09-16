@@ -196,12 +196,19 @@ def main():
         if probs is not None:
             arr = np.asarray(probs)
             st.subheader("Probabilities")
-            if arr.ndim == 1:
-                st.write(arr.tolist())
-            else:
+            if arr.ndim == 0:
+                # scalar → 1x1 frame
+                st.dataframe(pd.DataFrame([[float(arr)]], columns=["prob"]))
+            elif arr.ndim == 1:
+                # 1-D → Nx1 frame
+                st.dataframe(pd.DataFrame(arr.reshape(-1, 1), columns=["prob"]))
+            elif arr.ndim == 2:
+                # already 2-D
                 st.dataframe(pd.DataFrame(arr))
-
-        # Tiny diagnostic (collapsed)
+            else:
+                # higher-D → flatten columns
+                st.dataframe(pd.DataFrame(arr.reshape(arr.shape[0], -1)))
+                    # Tiny diagnostic (collapsed)
         with st.expander("Details (preprocessing)", expanded=False):
             missing = [c for c in fcols if c not in raw_df.columns]
             extra = [c for c in raw_df.columns if c not in fcols]
