@@ -11,6 +11,64 @@ import streamlit as st
 # Use the NaN-safe loader + predictor from the shim we added earlier
 from predict_safe_shim import predict_safe, load_artifacts_from_bundle
 
+# Label order must match your training order
+LABELS_FULL = [
+    "Aortic Stenosis",
+    "Aortic Regurgitation",
+    "Mitral Regurgitation",
+    "Mitral Stenosis",
+    "Normal",
+]
+
+def most_likely_from_probs(probs) -> tuple[int, float]:
+    """
+    Return (best_idx, best_p_present) for a **single sample**.
+    Accepts numpy arrays or sklearn's list-of-arrays from MultiOutput.
+    """
+    import numpy as np
+
+    # List-of-arrays case (common for MultiOutputClassifier)
+    if isinstance(probs, list):
+        p_present = []
+        for p in probs:
+            a = np.asarray(p)
+            # expect shape (1, n_classes). Use last column as "present".
+            if a.ndim == 1:
+                # (2,) → binary
+                p_present.append(float(a[-1]))
+            elif a.ndim == 2:
+                p_present.append(float(a[0, -1]))
+            else:
+                # fallback: flatten
+                p_present.append(float(a.reshape(-1)[-1]))
+        p_present = np.asarray(p_present)
+
+    else:
+        a = np.asarray(probs)
+        # expect (n_labels, 2) for a single sample
+        if a.ndim == 2:
+            if a.shape[1] >= 2:
+                p_present = a[:, 1]
+            else:
+                p_present = a[:, 0]
+        elif a.ndim == 3:
+            # (n_samples, n_labels, n_classes) → use sample 0
+            if a.shape[2] >= 2:
+                p_present = a[0, :, 1]
+            else:
+                p_present = a[0, :, 0]
+        elif a.ndim == 1:
+            # degenerate: a single binary prob for one label
+            p_present = np.array([a[-1]])
+        else:
+            # last-resort flatten
+            flat = a.reshape(-1)
+            p_present = np.array([flat[-1]])
+
+    best_idx = int(np.argmax(p_present))
+    best_p = float(p_present[best_idx])
+    return best_idx, best_p
+
 st.set_page_config(page_title="Heart Disease Model – Simple Predictor", layout="centered")
 
 
@@ -189,26 +247,22 @@ def main():
             st.stop()
 
         # --- Results ---
-        st.subheader("Prediction")
-        st.write(np.asarray(y_pred).tolist())
+        st.subheader("Result")
 
-        # Optional: show probabilities if the estimator supports it
         if probs is not None:
-            arr = np.asarray(probs)
-            st.subheader("Probabilities")
-            if arr.ndim == 0:
-                # scalar → 1x1 frame
-                st.dataframe(pd.DataFrame([[float(arr)]], columns=["prob"]))
-            elif arr.ndim == 1:
-                # 1-D → Nx1 frame
-                st.dataframe(pd.DataFrame(arr.reshape(-1, 1), columns=["prob"]))
-            elif arr.ndim == 2:
-                # already 2-D
-                st.dataframe(pd.DataFrame(arr))
-            else:
-                # higher-D → flatten columns
-                st.dataframe(pd.DataFrame(arr.reshape(arr.shape[0], -1)))
-                    # Tiny diagnostic (collapsed)
+            best_idx, best_p = most_likely_from_probs(probs)
+            label = LABELS_FULL[best_idx] if best_idx < len(LABELS_FULL) else f"Label {best_idx}"
+            st.markdown(f"**{label}** is **{best_p*100:.1f}%** likely.")
+        else:
+            # Fallback if the model doesn’t expose predict_proba
+            # We pick the first positive prediction if any; confidence not available.
+            y = np.asarray(y_pred).ravel().tolist()
+            try:
+                best_idx = y.index(1)
+                label = LABELS_FULL[best_idx] if best_idx < len(LABELS_FULL) else f"Label {best_idx}"
+                st.markdown(f"**{label}** is **(confidence unavailable)**.")
+            except ValueError:
+                st.markdown("**No condition predicted present** (confidence unavailable).")
         with st.expander("Details (preprocessing)", expanded=False):
             missing = [c for c in fcols if c not in raw_df.columns]
             extra = [c for c in raw_df.columns if c not in fcols]
